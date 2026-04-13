@@ -8,7 +8,7 @@
 #
 # Compare GitHub vs GitLab with git ls-remote first (no local clone if identical).
 # If refs differ: use persistent bare cache, fetch GitHub + GitLab branch tips, classify
-# with merge-base, then git push --mirror (minimal object transfer) or --mirror --force.
+# with merge-base, then push branches+tags to GitLab (not full --mirror: avoids refs/pull/*).
 
 set -euo pipefail
 
@@ -30,7 +30,7 @@ Usage: mirror_superset.sh [--dry-run] [--force] [--continue-on-error]
   --gitlab-user             Override GITLAB_USER (path segment in clone URL).
 
 Lists GitHub repos with affiliation=owner (your repos and forks you own).
-When a push runs, mirrors all branches and tags (git push --mirror).
+When a push runs, syncs all branches and tags (not git push --mirror, to avoid GitHub PR refs).
 
 Environment: GITHUB_USER, GITHUB_TOKEN, GITLAB_USER, GITLAB_TOKEN
 EOF
@@ -210,6 +210,16 @@ configure_gitlab_remote() {
   fi
 }
 
+# git push --mirror also pushes GitHub PR refs (refs/pull/*), which GitLab rejects
+# as hidden/forbidden. Push only branches and tags; --prune drops removed branches on GitLab.
+push_gitlab_heads_and_tags() {
+  local dir="$1"
+  shift
+  git -C "$dir" push --prune "$@" gitlab \
+    "+refs/heads/*:refs/heads/*" \
+    "+refs/tags/*:refs/tags/*"
+}
+
 # 0 = diverged on at least one shared branch (GitLab tip not ancestor of GitHub tip).
 branch_divergence_detected() {
   local dir="$1"
@@ -262,7 +272,7 @@ sync_repo() {
     dry "git clone --mirror <github-url> ${dir}"
     dry "git -C ${dir} remote add gitlab <gitlab-url>"
     dry "git -C ${dir} fetch --prune origin"
-    dry "git -C ${dir} push --mirror gitlab"
+    dry "git -C ${dir} push --prune gitlab +refs/heads/*:refs/heads/* +refs/tags/*:refs/tags/*"
     [[ "$DRY_RUN" -eq 1 ]] && return 0
 
     gitlab_create_project "$repo" "$is_private" || return 1
@@ -278,9 +288,9 @@ sync_repo() {
       error "${repo}: git fetch --prune origin failed."
       return 1
     }
-    log "PUSH ${repo}: initial git push --mirror (new GitLab project)"
-    git -C "$dir" push --mirror gitlab || {
-      error "${repo}: git push --mirror to GitLab failed."
+    log "PUSH ${repo}: initial push branches+tags to GitLab (new GitLab project)"
+    push_gitlab_heads_and_tags "$dir" || {
+      error "${repo}: git push to GitLab failed."
       return 1
     }
     return 0
@@ -300,7 +310,7 @@ sync_repo() {
   dry "git -C ${dir} fetch --prune origin"
   dry "git -C ${dir} remote add|set-url gitlab <gitlab-url>"
   dry "git -C ${dir} fetch gitlab +refs/heads/*:refs/remotes/gitlab/*"
-  dry "# merge-base per shared branch; then git push --mirror [ --force ] gitlab"
+  dry "# merge-base per shared branch; then push branches+tags [ --force ] to gitlab"
   [[ "$DRY_RUN" -eq 1 ]] && return 0
 
   mkdir -p "$MIRROR_CACHE"
@@ -327,17 +337,17 @@ sync_repo() {
       warn "${repo}: diverged on at least one branch; skipping push (re-run with --force to overwrite GitLab)"
       return 0
     fi
-    log "PUSH ${repo}: git push --mirror --force gitlab (diverged histories)"
-    git -C "$dir" push --mirror --force gitlab || {
-      error "${repo}: git push --mirror --force to GitLab failed."
+    log "PUSH ${repo}: force push branches+tags to gitlab (diverged histories)"
+    push_gitlab_heads_and_tags "$dir" --force || {
+      error "${repo}: git push --force to GitLab failed."
       return 1
     }
     return 0
   fi
 
-  log "PUSH ${repo}: git push --mirror gitlab (fast-forwardable / new refs)"
-  git -C "$dir" push --mirror gitlab || {
-    error "${repo}: git push --mirror to GitLab failed."
+  log "PUSH ${repo}: push branches+tags to gitlab (fast-forwardable / new refs)"
+  push_gitlab_heads_and_tags "$dir" || {
+    error "${repo}: git push to GitLab failed."
     return 1
   }
 }
