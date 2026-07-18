@@ -6,6 +6,7 @@
 # Env (required): GITHUB_USER, GITHUB_TOKEN, GITLAB_USER, GITLAB_TOKEN
 # Optional: GITHUB_API, GITLAB_HOST (default https://gitlab.com),
 #           MIRROR_CACHE (default ~/.cache/mirror-github-to-gitlab),
+#           GITLAB_API_RETRIES (default 3), GITLAB_API_RETRY_DELAY seconds (default 2),
 #           MIRROR_SYNC_ISSUES=1, MIRROR_SYNC_ISSUE_COMMENTS=1 (same as CLI flags),
 #           MIRROR_GITHUB_REPO_LIST=affiliation-owner|type-owner (default before --github-repo-list).
 #
@@ -105,9 +106,14 @@ gitlab_host_plain="${gitlab_host_plain#http://}"
 gitlab_host_plain="${gitlab_host_plain%/}"
 GITLAB_API="${GITLAB_HOST}/api/v4"
 MIRROR_CACHE="${MIRROR_CACHE:-$HOME/.cache/mirror-github-to-gitlab}"
+GITLAB_API_RETRIES="${GITLAB_API_RETRIES:-3}"
+GITLAB_API_RETRY_DELAY="${GITLAB_API_RETRY_DELAY:-2}"
 
 # Set when --gitlab-namespace-id or successful --use-user-namespace-id lookup.
 GITLAB_NAMESPACE_ID=""
+# Last HTTP status/body from gitlab_project_get (used by helpers below).
+GITLAB_HTTP_CODE=""
+GITLAB_LAST_BODY=""
 
 declare -A REPO_PRIVATE=()
 
@@ -143,12 +149,125 @@ gitlab_api_put() {
   curl -sS -f -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -H "Content-Type: application/json" "$@"
 }
 
-gitlab_project_numeric_id() {
+gitlab_http_retryable() {
+  case "$1" in
+    000|429|502|503|504) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# GET /projects/:id. Sets GITLAB_HTTP_CODE and GITLAB_LAST_BODY.
+gitlab_project_get() {
   local repo="$1"
-  local enc json
+  local enc url attempt delay max_retries code body_tmp
   enc=$(gitlab_project_path_encoded "$repo")
-  json=$(gitlab_curl_get "${GITLAB_API}/projects/${enc}") || return 1
+  url="${GITLAB_API}/projects/${enc}"
+  max_retries="${GITLAB_API_RETRIES}"
+  delay="${GITLAB_API_RETRY_DELAY}"
+  body_tmp=$(mktemp)
+
+  for attempt in $(seq 1 "$max_retries"); do
+    code=$(curl -sS -o "$body_tmp" -w '%{http_code}' -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+      "$url" 2>/dev/null) || code="000"
+
+    if gitlab_http_retryable "$code" && [[ "$attempt" -lt "$max_retries" ]]; then
+      warn "GitLab GET ${GITLAB_USER}/${repo}: HTTP ${code}, retry ${attempt}/${max_retries} in ${delay}s"
+      sleep "$delay"
+      delay=$((delay * 2))
+      continue
+    fi
+
+    GITLAB_HTTP_CODE="$code"
+    GITLAB_LAST_BODY=$(cat "$body_tmp")
+    rm -f "$body_tmp"
+    return 0
+  done
+
+  GITLAB_HTTP_CODE="000"
+  GITLAB_LAST_BODY=""
+  rm -f "$body_tmp"
+  return 0
+}
+
+gitlab_get_project_json() {
+  local repo="$1"
+  gitlab_project_get "$repo"
+  [[ "${GITLAB_HTTP_CODE}" == "200" ]] || return 1
+  printf '%s' "${GITLAB_LAST_BODY}"
+}
+
+gitlab_project_numeric_id() {
+  local repo="$1" json
+  json=$(gitlab_get_project_json "$repo") || return 1
   printf '%s' "$json" | jq -r '.id | tostring'
+}
+
+github_visibility_to_gitlab() {
+  [[ "$1" == "true" ]] && printf 'private' || printf 'public'
+}
+
+gitlab_api_error_message() {
+  local body="$1"
+  if [[ -z "$body" ]]; then
+    printf '(empty response body)'
+    return 0
+  fi
+  printf '%s' "$body" | jq -r '
+    if type == "object" then
+      (.message // .error // .)
+      | if type == "object" then to_entries | map("\(.key): \(.value)") | join("; ")
+        elif type == "array" then join("; ")
+        else tostring end
+    else tostring end
+  ' 2>/dev/null || printf '%s' "$body"
+}
+
+gitlab_sync_visibility() {
+  local repo="$1"
+  local is_private="$2"
+  local expected actual json project_id update_body code body_tmp msg
+  local attempt delay max_retries
+  expected=$(github_visibility_to_gitlab "$is_private")
+
+  json=$(gitlab_get_project_json "$repo") || {
+    warn "${repo}: visibility sync skipped (could not read GitLab project)."
+    return 0
+  }
+  actual=$(printf '%s' "$json" | jq -r '.visibility // empty')
+  project_id=$(printf '%s' "$json" | jq -r '.id // empty')
+  [[ -n "$actual" && -n "$project_id" ]] || return 0
+  [[ "$actual" == "$expected" ]] && return 0
+
+  log "VISIBILITY ${repo}: GitLab=${actual} GitHub=${expected}; updating GitLab"
+  update_body=$(jq -n --arg v "$expected" '{visibility: $v}')
+  dry "PUT ${GITLAB_API}/projects/${project_id} visibility=${expected}"
+  [[ "$DRY_RUN" -eq 1 ]] && return 0
+
+  body_tmp=$(mktemp)
+  max_retries="${GITLAB_API_RETRIES}"
+  delay="${GITLAB_API_RETRY_DELAY}"
+  for attempt in $(seq 1 "$max_retries"); do
+    code=$(curl -sS -o "$body_tmp" -w '%{http_code}' \
+      -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -H "Content-Type: application/json" \
+      -X PUT "${GITLAB_API}/projects/${project_id}" -d "$update_body" 2>/dev/null) || code="000"
+
+    if [[ "$code" == "200" ]]; then
+      rm -f "$body_tmp"
+      return 0
+    fi
+    if gitlab_http_retryable "$code" && [[ "$attempt" -lt "$max_retries" ]]; then
+      warn "GitLab PUT visibility ${repo}: HTTP ${code}, retry ${attempt}/${max_retries} in ${delay}s"
+      sleep "$delay"
+      delay=$((delay * 2))
+      continue
+    fi
+    msg=$(gitlab_api_error_message "$(cat "$body_tmp" 2>/dev/null)")
+    warn "${repo}: visibility update failed (HTTP ${code}): ${msg}"
+    rm -f "$body_tmp"
+    return 0
+  done
+  rm -f "$body_tmp"
+  return 0
 }
 
 # Copy GitHub issues (not PRs) into GitLab. Idempotent via state JSON mapping
@@ -343,11 +462,8 @@ fetch_github_repo_index() {
 }
 
 gitlab_project_http_code() {
-  local repo="$1"
-  local enc
-  enc=$(gitlab_project_path_encoded "$repo")
-  curl -sS -o /dev/null -w '%{http_code}' -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
-    "${GITLAB_API}/projects/${enc}" 2>/dev/null || printf '000'
+  gitlab_project_get "$1"
+  printf '%s' "${GITLAB_HTTP_CODE}"
 }
 
 gitlab_create_project() {
@@ -355,7 +471,7 @@ gitlab_create_project() {
   local is_private="$2"
   local visibility="public"
   [[ "$is_private" == "true" ]] && visibility="private"
-  local body
+  local body code body_tmp msg attempt delay max_retries
   if [[ -n "${GITLAB_NAMESPACE_ID}" ]]; then
     body=$(jq -n \
       --arg name "$repo" \
@@ -373,12 +489,45 @@ gitlab_create_project() {
     dry "curl -X POST ${GITLAB_API}/projects (JSON create ${GITLAB_USER}/${repo}, visibility=${visibility})"
   fi
   [[ "$DRY_RUN" -eq 1 ]] && return 0
-  curl -sS -f -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -X POST "${GITLAB_API}/projects" \
-    -H 'Content-Type: application/json' -d "$body" >/dev/null \
-    || {
-      error "GitLab API: failed to create project '${repo}' (${GITLAB_USER}/${repo})."
-      return 1
-    }
+
+  body_tmp=$(mktemp)
+  max_retries="${GITLAB_API_RETRIES}"
+  delay="${GITLAB_API_RETRY_DELAY}"
+  for attempt in $(seq 1 "$max_retries"); do
+    code=$(curl -sS -o "$body_tmp" -w '%{http_code}' \
+      -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -H "Content-Type: application/json" \
+      -X POST "${GITLAB_API}/projects" -d "$body" 2>/dev/null) || code="000"
+
+    if [[ "$code" == "201" ]]; then
+      rm -f "$body_tmp"
+      return 0
+    fi
+
+    if [[ "$code" == "400" ]]; then
+      gitlab_project_get "$repo"
+      if [[ "${GITLAB_HTTP_CODE}" == "200" ]]; then
+        warn "${repo}: create returned HTTP 400 but project already exists; continuing."
+        rm -f "$body_tmp"
+        return 0
+      fi
+    fi
+
+    if gitlab_http_retryable "$code" && [[ "$attempt" -lt "$max_retries" ]]; then
+      warn "GitLab POST create ${repo}: HTTP ${code}, retry ${attempt}/${max_retries} in ${delay}s"
+      sleep "$delay"
+      delay=$((delay * 2))
+      continue
+    fi
+
+    msg=$(gitlab_api_error_message "$(cat "$body_tmp" 2>/dev/null)")
+    error "GitLab API: failed to create project '${repo}' (${GITLAB_USER}/${repo}, HTTP ${code}): ${msg}"
+    rm -f "$body_tmp"
+    return 1
+  done
+
+  error "GitLab API: failed to create project '${repo}' (${GITLAB_USER}/${repo}, HTTP 000): exhausted retries"
+  rm -f "$body_tmp"
+  return 1
 }
 
 configure_gitlab_remote() {
@@ -445,9 +594,13 @@ sync_repo() {
     return 0
   fi
 
-  if [[ "$gl_code" == "000" ]]; then
+  if [[ "$gl_code" == "000" ]] || gitlab_http_retryable "$gl_code"; then
     error "${repo}: could not reach GitLab API or project URL (HTTP ${gl_code})."
     return 1
+  fi
+
+  if [[ "$gl_code" == "200" ]]; then
+    gitlab_sync_visibility "$repo" "$is_private"
   fi
 
   if [[ "$gl_code" != "200" ]]; then
@@ -461,6 +614,7 @@ sync_repo() {
     [[ "$DRY_RUN" -eq 1 ]] && return 0
 
     gitlab_create_project "$repo" "$is_private" || return 1
+    gitlab_sync_visibility "$repo" "$is_private"
     mkdir -p "$MIRROR_CACHE"
     if [[ ! -d "$dir" ]]; then
       git clone --mirror "$gh_url" "$dir" || {
