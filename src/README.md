@@ -39,7 +39,7 @@ Common optional variables (repo scripts and gists):
 |----------|---------|---------|
 | `GITHUB_API` | `https://api.github.com` | GitHub API base URL |
 | `GITLAB_HOST` | `https://gitlab.com` | GitLab host (repo scripts and gists) |
-| `GITLAB_API_RETRIES` | `3` | Retries on transient GitLab HTTP errors (`000`, `429`, `502`, `503`, `504`) |
+| `GITLAB_API_RETRIES` | `3` | Retries on transient HTTP errors (`000`, `429`, `502`, `503`, `504`) for GitLab, and for GitHub when `--bidirectional` |
 | `GITLAB_API_RETRY_DELAY` | `2` | Initial retry delay in seconds (doubles each retry) |
 
 Repo scripts (`mirror_superset.sh`, `mirror_consolidated.sh`) additionally support:
@@ -49,6 +49,7 @@ Repo scripts (`mirror_superset.sh`, `mirror_consolidated.sh`) additionally suppo
 | `MIRROR_CACHE` | `~/.cache/mirror-github-to-gitlab` | Persistent bare-repo cache |
 | `MIRROR_SYNC_ISSUES` | `0` | Set to `1` to enable issue sync (same as `--sync-issues`) |
 | `MIRROR_SYNC_ISSUE_COMMENTS` | `0` | Set to `1` to copy issue comments (same as `--sync-issue-comments`) |
+| `MIRROR_BIDIRECTIONAL` | `0` | Set to `1` for two-way fast-forward sync (same as `--bidirectional`) |
 
 `mirror_consolidated.sh` also supports `MIRROR_GITHUB_REPO_LIST` (`affiliation-owner` or `type-owner`).
 
@@ -63,12 +64,23 @@ Repo scripts (`mirror_superset.sh`, `mirror_consolidated.sh`) additionally suppo
 3. Create missing GitLab projects, push changed refs via a persistent bare cache, optionally sync issues.
 4. Sync **visibility** (`public` / `private`) from GitHub on every run for existing projects; set on create for new projects.
 
+`--bidirectional` (opt-in; default remains GitHub → GitLab):
+
+1. Union GitHub owned repos with GitLab owned projects (or projects in `--gitlab-namespace-id`).
+2. Create missing repos **either way** (`POST /user/repos` on GitHub; existing GitLab create).
+3. If `ls-remote` refs differ, fetch both remotes into namespaced cache refs (heads + tags; not `refs/pull/*` or `refs/merge-requests/*`).
+4. **Per ref**: fast-forward GitHub→GitLab or GitLab→GitHub; copy refs that exist on only one side; **skip** diverged branches and tag SHA clashes.
+5. Never prune. `--force` is rejected. Issue sync stays one-way GitHub → GitLab.
+6. Visibility is still GitHub-wins when **both** repos already existed; newly created repos take the source side's visibility.
+7. After first populating a newly created repo, set its default branch to the source's default.
+
 ### CLI flags (both repo scripts)
 
 | Flag | Description |
 |------|-------------|
 | `--dry-run` | Log operations only; no API writes or git fetch/push |
-| `--force` | Force-push branches+tags when histories have diverged |
+| `--force` | Force-push branches+tags when histories have diverged (one-way only; incompatible with `--bidirectional`) |
+| `--bidirectional` | Two-way fast-forward: union inventory, create missing repos either way, per-ref FF, never prune, skip conflicts |
 | `--continue-on-error` | Process all repos; exit 1 if any failed |
 | `--use-user-namespace-id` | Resolve GitLab user id and pass `namespace_id` when creating projects |
 | `--gitlab-namespace-id ID` | Use a specific namespace id for new projects (e.g. a group) |
@@ -95,14 +107,20 @@ bash mirror_consolidated.sh --github-repo-list type-owner --continue-on-error
 ```
 
 ```bash
+bash mirror_superset.sh --bidirectional --dry-run
+```
+
+```bash
 GITLAB_API_RETRIES=5 MIRROR_SYNC_ISSUES=1 bash mirror_superset.sh
 ```
 
 ### Resilience (superset + consolidated)
 
 - GitLab GET/POST/PUT calls retry on transient errors.
+- Bidirectional GitHub GET/POST/PATCH (create repo, default branch) uses the same retry/backoff settings.
 - Failed API responses include the GitLab error body in logs.
 - If project create returns HTTP 400 but the project already exists, the script continues instead of failing.
+- Bidirectional GitHub create treats HTTP 422 as success when the repository already exists.
 
 ---
 
@@ -154,7 +172,7 @@ GITLAB_HOST=https://gitlab.example.com bash mirror_gists.sh
 | **GitHub REST auth** | `Authorization: token …` | `Authorization: Bearer …` + `Accept` + `X-GitHub-Api-Version` |
 | **GitLab REST auth** | `Authorization: Bearer …` | `PRIVATE-TOKEN: …` |
 | **Hosts** | Hard-coded `api.github.com` / `gitlab.com` | `GITHUB_API`, `GITLAB_HOST` |
-| **CLI** | `--dry-run`, `--force` only | `--dry-run`, `--force`, `--continue-on-error`, `--help`, user overrides, `--sync-issues`, `--sync-issue-comments`, namespace options |
+| **CLI** | `--dry-run`, `--force` only | `--dry-run`, `--force`, `--bidirectional`, `--continue-on-error`, `--help`, user overrides, `--sync-issues`, `--sync-issue-comments`, namespace options |
 | **Repo cache** | Temp bare clone per push, deleted on exit | Persistent `MIRROR_CACHE` mirror repos |
 | **Remote compare** | `git ls-remote --heads` only (branches; **tags not compared**) | `git ls-remote --refs` filtered to **heads + tags**, sorted (full ref identity) |
 | **Push** | `git push --all` + `--tags` | `push --prune` with explicit `+refs/heads/*` / `+refs/tags/*` (avoids GitHub `refs/pull/*` problems) |
@@ -176,11 +194,14 @@ GITLAB_HOST=https://gitlab.example.com bash mirror_gists.sh
 
 1. **`set -u`**, broader CLI, **`--help`**.
 2. **Configurable** `GITHUB_API` / `GITLAB_HOST`.
-3. **Persistent mirror cache** and **pruned** ref push (safer for GitHub → GitLab).
+3. **Persistent mirror cache** and **pruned** ref push in one-way mode (safer for GitHub → GitLab). `--bidirectional` never prunes.
 4. **Tags included** in `ls-remote` comparison (`mirror_gemini.sh` only compared **heads**, so **tag-only drift could be missed**).
 5. **Optional** issue sync + **issue comments** + **JSON state file** idempotency.
 6. **`--continue-on-error`**, GitLab **namespace_id** for new projects, **public/private** from GitHub (create + ongoing sync).
 7. **GitLab API retries** with exponential backoff; create treats HTTP 400 as success when the project already exists.
+8. **`--bidirectional`**: union GitHub+GitLab inventory, create missing repos either way, per-ref fast-forward, skip diverged refs and tag clashes.
+
+Bidirectional GitHub writes need a token that can **create repositories and push** (classic PAT `repo` scope, including private repos if you have any). GitLab already needs `api` plus `write_repository`. HTTPS remotes stay `x-access-token` / `oauth2`; still no SSH.
 
 ---
 

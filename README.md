@@ -13,6 +13,8 @@ For each GitHub repo you own (including your forks), the script compares GitHub 
 - **Diverged histories** — skip, or overwrite GitLab with `--force`
 - **Missing on GitLab** — create the project and push
 
+With `--bidirectional`, the same comparison runs **per ref in both directions**: GitLab-only repos are created on GitHub, fast-forwardable refs are pushed to whichever side is behind, and diverged branches / tag SHA clashes are skipped (never prune, never `--force`).
+
 Additional behavior:
 
 - Compares **all branches and tags**, not just the default branch
@@ -42,6 +44,12 @@ Mirror repositories:
 
 ```bash
 bash src/mirror_superset.sh
+```
+
+Two-way fast-forward (GitHub ↔ GitLab):
+
+```bash
+bash src/mirror_superset.sh --bidirectional
 ```
 
 Mirror gists:

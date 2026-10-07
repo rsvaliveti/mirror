@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # mirror_consolidated.sh — mirror_superset.sh plus a configurable GitHub repo listing mode.
-# Sync GitHub -> GitLab for repos you own (including your forks). No gh/gitlab CLI.
+# Sync GitHub -> GitLab (default) or GitHub <-> GitLab (--bidirectional) for repos you
+# own (including your forks). No gh/gitlab CLI.
 # Tools: bash, git, curl, jq (wget available on Ubuntu but unused here).
 #
 # Env (required): GITHUB_USER, GITHUB_TOKEN, GITLAB_USER, GITLAB_TOKEN
@@ -8,21 +9,24 @@
 #           MIRROR_CACHE (default ~/.cache/mirror-github-to-gitlab),
 #           GITLAB_API_RETRIES (default 3), GITLAB_API_RETRY_DELAY seconds (default 2),
 #           MIRROR_SYNC_ISSUES=1, MIRROR_SYNC_ISSUE_COMMENTS=1 (same as CLI flags),
+#           MIRROR_BIDIRECTIONAL=1 (same as --bidirectional),
 #           MIRROR_GITHUB_REPO_LIST=affiliation-owner|type-owner (default before --github-repo-list).
 #
 # Compare GitHub vs GitLab with git ls-remote first (no local clone if identical).
-# If refs differ: use persistent bare cache, fetch GitHub + GitLab branch tips, classify
-# with merge-base, then push branches+tags to GitLab (not full --mirror: avoids refs/pull/*).
+# One-way: if refs differ, use persistent bare cache, fetch GitHub + GitLab branch tips,
+# classify with merge-base, then push branches+tags to GitLab (not full --mirror: avoids
+# refs/pull/*). Bidirectional: union inventory, create missing repos either way, per-ref
+# fast-forward both directions, never prune; skip diverged branches and tag SHA clashes.
 #
 # Optional issue migration (--sync-issues): copies GitHub *issues* (not pull requests) into
-# GitLab via REST APIs. Labels/milestones/projects are not mapped. State:
+# GitLab via REST APIs (still one-way). Labels/milestones/projects are not mapped. State:
 # ${MIRROR_CACHE}/.issue-sync/<repo>.json (GitHub number -> GitLab IID).
 
 set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: mirror_consolidated.sh [--dry-run] [--force] [--continue-on-error]
+Usage: mirror_consolidated.sh [--dry-run] [--force] [--bidirectional] [--continue-on-error]
           [--use-user-namespace-id | --gitlab-namespace-id ID]
           [--github-user USER] [--gitlab-user USER] [--sync-issues] [--sync-issue-comments]
 
@@ -30,6 +34,10 @@ Usage: mirror_consolidated.sh [--dry-run] [--force] [--continue-on-error]
   --github-repo-list MODE   GitHub /user/repos filter: affiliation-owner (default) or
                             type-owner (same query as mirror_gemini.sh user/repos?type=owner).
   --force                   If any shared branch diverged, force-push branches+tags to GitLab.
+                            Incompatible with --bidirectional.
+  --bidirectional           Two-way fast-forward: union GitHub+GitLab inventory, create
+                            missing repos either way, per-ref FF both directions, never prune.
+                            Diverged branches and tag SHA clashes are skipped.
   --continue-on-error       Process all repos; exit 1 if any repo failed (default:
                             stop on first failure).
   --use-user-namespace-id   Resolve GitLab user id via API (v2-style) and pass
@@ -43,8 +51,9 @@ Usage: mirror_consolidated.sh [--dry-run] [--force] [--continue-on-error]
   --sync-issue-comments     With --sync-issues, copy issue comments as GitLab notes when an
                             issue is first created.
 
-Default: lists GitHub repos with affiliation=owner; use --github-repo-list type-owner for user/repos?type=owner.
-When a push runs, syncs all branches and tags (not git push --mirror, to avoid GitHub PR refs).
+Default: GitHub → GitLab. Lists GitHub repos with affiliation=owner; use --github-repo-list type-owner for user/repos?type=owner.
+When a one-way push runs, syncs all branches and tags (not git push --mirror, to avoid GitHub PR refs).
+--bidirectional also lists owned GitLab projects and fast-forwards refs either way.
 
 Environment: GITHUB_USER, GITHUB_TOKEN, GITLAB_USER, GITLAB_TOKEN
 EOF
@@ -59,6 +68,7 @@ OVERRIDE_GH_USER=""
 OVERRIDE_GL_USER=""
 SYNC_ISSUES=0
 SYNC_ISSUE_COMMENTS=0
+BIDIRECTIONAL=0
 
 GITHUB_REPO_LIST_MODE="${MIRROR_GITHUB_REPO_LIST:-affiliation-owner}"
 
@@ -66,6 +76,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
     --force) FORCE=1 ;;
+    --bidirectional) BIDIRECTIONAL=1 ;;
     --continue-on-error) CONTINUE_ON_ERROR=1 ;;
     --use-user-namespace-id) USE_USER_NAMESPACE_LOOKUP=1 ;;
     --gitlab-namespace-id)
@@ -91,7 +102,13 @@ done
 
 [[ "${MIRROR_SYNC_ISSUES:-0}" == "1" ]] && SYNC_ISSUES=1
 [[ "${MIRROR_SYNC_ISSUE_COMMENTS:-0}" == "1" ]] && SYNC_ISSUE_COMMENTS=1
+[[ "${MIRROR_BIDIRECTIONAL:-0}" == "1" ]] && BIDIRECTIONAL=1
 [[ "$SYNC_ISSUE_COMMENTS" -eq 1 ]] && SYNC_ISSUES=1
+
+if [[ "$BIDIRECTIONAL" -eq 1 && "$FORCE" -eq 1 ]]; then
+  printf '[ERROR] %s\n' "--force cannot be combined with --bidirectional (diverged refs are skipped)." >&2
+  exit 1
+fi
 
 : "${GITHUB_TOKEN:?GITHUB_TOKEN is required}"
 : "${GITLAB_TOKEN:?GITLAB_TOKEN is required}"
@@ -114,8 +131,13 @@ GITLAB_NAMESPACE_ID=""
 # Last HTTP status/body from gitlab_project_get (used by helpers below).
 GITLAB_HTTP_CODE=""
 GITLAB_LAST_BODY=""
+GITHUB_HTTP_CODE=""
+GITHUB_LAST_BODY=""
 
 declare -A REPO_PRIVATE=()
+declare -A REPO_ON_GITHUB=()
+declare -A REPO_ON_GITLAB=()
+declare -A REPO_GL_VISIBILITY=()
 
 log()   { printf '%s\n' "$*"; }
 warn()  { printf '[WARN] %s\n' "$*" >&2; }
@@ -574,8 +596,542 @@ branch_divergence_detected() {
   return 1
 }
 
+# --- Bidirectional v1: per-ref fast-forward, never prune, skip conflicts ---
+
+github_http_retryable() {
+  gitlab_http_retryable "$1"
+}
+
+# GET/POST/PATCH GitHub. Sets GITHUB_HTTP_CODE and GITHUB_LAST_BODY.
+github_api_request() {
+  local method="$1" url="$2" body="${3:-}"
+  local attempt delay max_retries code body_tmp
+  max_retries="${GITLAB_API_RETRIES}"
+  delay="${GITLAB_API_RETRY_DELAY}"
+  body_tmp=$(mktemp)
+
+  for attempt in $(seq 1 "$max_retries"); do
+    if [[ -n "$body" ]]; then
+      code=$(curl -sS -o "$body_tmp" -w '%{http_code}' -X "$method" \
+        -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+        -H "Accept: application/vnd.github+json" \
+        -H "X-GitHub-Api-Version: 2022-11-28" \
+        -H "Content-Type: application/json" \
+        -d "$body" "$url" 2>/dev/null) || code="000"
+    else
+      code=$(curl -sS -o "$body_tmp" -w '%{http_code}' -X "$method" \
+        -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+        -H "Accept: application/vnd.github+json" \
+        -H "X-GitHub-Api-Version: 2022-11-28" \
+        "$url" 2>/dev/null) || code="000"
+    fi
+
+    if github_http_retryable "$code" && [[ "$attempt" -lt "$max_retries" ]]; then
+      warn "GitHub ${method} ${url}: HTTP ${code}, retry ${attempt}/${max_retries} in ${delay}s"
+      sleep "$delay"
+      delay=$((delay * 2))
+      continue
+    fi
+
+    GITHUB_HTTP_CODE="$code"
+    GITHUB_LAST_BODY=$(cat "$body_tmp")
+    rm -f "$body_tmp"
+    return 0
+  done
+
+  GITHUB_HTTP_CODE="000"
+  GITHUB_LAST_BODY=""
+  rm -f "$body_tmp"
+  return 0
+}
+
+# GET arbitrary GitLab URL. Sets GITLAB_HTTP_CODE and GITLAB_LAST_BODY.
+gitlab_http_get() {
+  local url="$1"
+  local attempt delay max_retries code body_tmp
+  max_retries="${GITLAB_API_RETRIES}"
+  delay="${GITLAB_API_RETRY_DELAY}"
+  body_tmp=$(mktemp)
+
+  for attempt in $(seq 1 "$max_retries"); do
+    code=$(curl -sS -o "$body_tmp" -w '%{http_code}' -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+      "$url" 2>/dev/null) || code="000"
+
+    if gitlab_http_retryable "$code" && [[ "$attempt" -lt "$max_retries" ]]; then
+      warn "GitLab GET ${url}: HTTP ${code}, retry ${attempt}/${max_retries} in ${delay}s"
+      sleep "$delay"
+      delay=$((delay * 2))
+      continue
+    fi
+
+    GITLAB_HTTP_CODE="$code"
+    GITLAB_LAST_BODY=$(cat "$body_tmp")
+    rm -f "$body_tmp"
+    return 0
+  done
+
+  GITLAB_HTTP_CODE="000"
+  GITLAB_LAST_BODY=""
+  rm -f "$body_tmp"
+  return 0
+}
+
+gitlab_visibility_to_github_private() {
+  case "$1" in
+    public) printf 'false' ;;
+    *) printf 'true' ;;
+  esac
+}
+
+join_csv() {
+  local out="" n
+  while IFS= read -r n; do
+    [[ -z "$n" ]] && continue
+    if [[ -z "$out" ]]; then
+      out="$n"
+    else
+      out="${out}, ${n}"
+    fi
+  done
+  [[ -z "$out" ]] && out="(none)"
+  printf '%s' "$out"
+}
+
+parse_ls_remote_heads_tags() {
+  local refs="$1"
+  local heads_file="$2"
+  local tags_file="$3"
+  : >"$heads_file"
+  : >"$tags_file"
+  [[ -z "$refs" ]] && return 0
+  while IFS=$'\t' read -r sha ref; do
+    [[ -z "${ref:-}" ]] && continue
+    case "$ref" in
+      refs/heads/*) printf '%s\t%s\n' "${ref#refs/heads/}" "$sha" >>"$heads_file" ;;
+      refs/tags/*) printf '%s\t%s\n' "${ref#refs/tags/}" "$sha" >>"$tags_file" ;;
+    esac
+  done <<< "$refs"
+}
+
+write_cache_refs() {
+  local dir="$1" prefix="$2" file="$3"
+  git -C "$dir" for-each-ref --format='%(refname)%09%(objectname)' "$prefix" \
+    | awk -F '\t' -v p="$prefix" '{
+        name=$1
+        sub("^" p, "", name)
+        if (name != "") print name "\t" $2
+      }' >"$file"
+}
+
+ref_sha_from_file() {
+  local file="$1" name="$2"
+  awk -F '\t' -v n="$name" '$1 == n { print $2; exit }' "$file"
+}
+
+unique_ref_names() {
+  local f1="$1" f2="$2"
+  awk -F '\t' 'NF { print $1 }' "$f1" "$f2" | LC_ALL=C sort -u
+}
+
+ensure_git_remote() {
+  local dir="$1" name="$2" url="$3"
+  dry "git -C ${dir} remote add|set-url ${name} <url>"
+  [[ "$DRY_RUN" -eq 1 ]] && return 0
+  if git -C "$dir" remote get-url "$name" &>/dev/null; then
+    git -C "$dir" remote set-url "$name" "$url"
+  else
+    git -C "$dir" remote add "$name" "$url"
+  fi
+}
+
+ensure_bare_cache() {
+  local dir="$1"
+  mkdir -p "$MIRROR_CACHE"
+  if [[ ! -d "$dir" ]]; then
+    dry "git init --bare ${dir}"
+    [[ "$DRY_RUN" -eq 1 ]] && return 0
+    git init --bare "$dir" || return 1
+  fi
+  return 0
+}
+
+# Fetch heads+tags into namespaced refs (never refs/pull/* or refs/merge-requests/*).
+fetch_bidirectional_refs() {
+  local dir="$1"
+  dry "git -C ${dir} fetch --prune github +refs/heads/*:refs/remotes/github/* +refs/tags/*:refs/sync/github/tags/*"
+  dry "git -C ${dir} fetch --prune gitlab +refs/heads/*:refs/remotes/gitlab/* +refs/tags/*:refs/sync/gitlab/tags/*"
+  [[ "$DRY_RUN" -eq 1 ]] && return 0
+  git -C "$dir" fetch --prune github \
+    "+refs/heads/*:refs/remotes/github/*" \
+    "+refs/tags/*:refs/sync/github/tags/*" || return 1
+  git -C "$dir" fetch --prune gitlab \
+    "+refs/heads/*:refs/remotes/gitlab/*" \
+    "+refs/tags/*:refs/sync/gitlab/tags/*" || return 1
+}
+
+push_named_ref() {
+  local dir="$1" remote="$2" src="$3" dst="$4"
+  dry "git -C ${dir} push ${remote} ${src}:${dst}"
+  [[ "$DRY_RUN" -eq 1 ]] && return 0
+  git -C "$dir" push "$remote" "${src}:${dst}"
+}
+
+github_create_repo() {
+  local repo="$1"
+  local is_private="$2"
+  local private_json="false"
+  local body
+  [[ "$is_private" == "true" ]] && private_json="true"
+  body=$(jq -n --arg name "$repo" --argjson private "$private_json" \
+    '{name: $name, private: $private, auto_init: false}')
+  dry "POST ${GITHUB_API}/user/repos name=${repo} private=${private_json}"
+  [[ "$DRY_RUN" -eq 1 ]] && return 0
+
+  github_api_request POST "${GITHUB_API}/user/repos" "$body"
+  if [[ "${GITHUB_HTTP_CODE}" == "201" ]]; then
+    return 0
+  fi
+  if [[ "${GITHUB_HTTP_CODE}" == "422" ]]; then
+    github_api_request GET "${GITHUB_API}/repos/${GITHUB_USER}/${repo}"
+    if [[ "${GITHUB_HTTP_CODE}" == "200" ]]; then
+      warn "${repo}: GitHub create returned HTTP 422 but repository already exists; continuing."
+      return 0
+    fi
+  fi
+  error "GitHub API: failed to create repository '${repo}' (HTTP ${GITHUB_HTTP_CODE}): $(gitlab_api_error_message "${GITHUB_LAST_BODY}")"
+  return 1
+}
+
+github_set_default_branch() {
+  local repo="$1" branch="$2"
+  local body
+  [[ -z "$branch" ]] && return 0
+  body=$(jq -n --arg b "$branch" '{default_branch: $b}')
+  dry "PATCH ${GITHUB_API}/repos/${GITHUB_USER}/${repo} default_branch=${branch}"
+  [[ "$DRY_RUN" -eq 1 ]] && return 0
+  github_api_request PATCH "${GITHUB_API}/repos/${GITHUB_USER}/${repo}" "$body"
+  if [[ "${GITHUB_HTTP_CODE}" != "200" ]]; then
+    warn "${repo}: could not set GitHub default_branch=${branch} (HTTP ${GITHUB_HTTP_CODE})."
+  fi
+  return 0
+}
+
+gitlab_set_default_branch() {
+  local repo="$1" branch="$2"
+  local project_id body
+  [[ -z "$branch" ]] && return 0
+  project_id=$(gitlab_project_numeric_id "$repo") || {
+    warn "${repo}: could not set GitLab default_branch=${branch} (no project id)."
+    return 0
+  }
+  body=$(jq -n --arg b "$branch" '{default_branch: $b}')
+  dry "PUT ${GITLAB_API}/projects/${project_id} default_branch=${branch}"
+  [[ "$DRY_RUN" -eq 1 ]] && return 0
+  gitlab_api_put -X PUT "${GITLAB_API}/projects/${project_id}" -d "$body" >/dev/null 2>&1 \
+    || warn "${repo}: could not set GitLab default_branch=${branch}."
+  return 0
+}
+
+fetch_gitlab_project_index() {
+  local page=1
+  local base json count
+  local filter_personal=0
+
+  if [[ -n "${GITLAB_NAMESPACE_ID}" ]]; then
+    gitlab_http_get "${GITLAB_API}/groups/${GITLAB_NAMESPACE_ID}"
+    if [[ "${GITLAB_HTTP_CODE}" == "200" ]]; then
+      base="${GITLAB_API}/groups/${GITLAB_NAMESPACE_ID}/projects?simple=true&archived=false&per_page=100"
+    else
+      base="${GITLAB_API}/users/${GITLAB_NAMESPACE_ID}/projects?simple=true&archived=false&per_page=100"
+    fi
+  else
+    base="${GITLAB_API}/projects?owned=true&simple=true&archived=false&per_page=100"
+    filter_personal=1
+  fi
+
+  while true; do
+    gitlab_http_get "${base}&page=${page}"
+    if [[ "${GITLAB_HTTP_CODE}" != "200" ]]; then
+      error "Failed to list GitLab projects (HTTP ${GITLAB_HTTP_CODE}): $(gitlab_api_error_message "${GITLAB_LAST_BODY}")"
+      return 1
+    fi
+    json="${GITLAB_LAST_BODY}"
+    if ! printf '%s' "$json" | jq -e 'type == "array"' &>/dev/null; then
+      error "GitLab project list returned non-array (HTTP ${GITLAB_HTTP_CODE})."
+      return 1
+    fi
+    count=$(printf '%s' "$json" | jq 'length')
+    [[ "$count" -eq 0 ]] && break
+    if [[ "$filter_personal" -eq 1 ]]; then
+      printf '%s' "$json" | jq -r --arg ns "$GITLAB_USER" \
+        '.[] | select(.namespace.path == $ns) | [.path, (.visibility // "private")] | @tsv'
+    else
+      printf '%s' "$json" | jq -r '.[] | [.path, (.visibility // "private")] | @tsv'
+    fi
+    [[ "$count" -lt 100 ]] && break
+    page=$((page + 1))
+  done
+}
+
+# Classify heads from two name/sha TSV files.
+# with_objects=1 uses merge-base in $dir; 0 treats unequal SHAs as needs-fetch.
+# Appends names to the given files (gh2gl, gl2gh, diverged, needs_fetch).
+classify_heads() {
+  local dir="$1" gh_file="$2" gl_file="$3" with_objects="$4"
+  local gh2gl="$5" gl2gh="$6" diverged="$7" needs_fetch="$8"
+  local bn gh_sha gl_sha
+
+  while IFS= read -r bn; do
+    [[ -z "$bn" ]] && continue
+    gh_sha=$(ref_sha_from_file "$gh_file" "$bn")
+    gl_sha=$(ref_sha_from_file "$gl_file" "$bn")
+    if [[ -z "$gh_sha" && -n "$gl_sha" ]]; then
+      printf '%s\n' "$bn" >>"$gl2gh"
+      continue
+    fi
+    if [[ -n "$gh_sha" && -z "$gl_sha" ]]; then
+      printf '%s\n' "$bn" >>"$gh2gl"
+      continue
+    fi
+    [[ "$gh_sha" == "$gl_sha" ]] && continue
+    if [[ "$with_objects" -eq 0 ]]; then
+      printf '%s\n' "$bn" >>"$needs_fetch"
+      continue
+    fi
+    gh_sha=$(git -C "$dir" rev-parse "refs/remotes/github/${bn}^{commit}" 2>/dev/null) || gh_sha=""
+    gl_sha=$(git -C "$dir" rev-parse "refs/remotes/gitlab/${bn}^{commit}" 2>/dev/null) || gl_sha=""
+    if [[ -z "$gh_sha" || -z "$gl_sha" ]]; then
+      printf '%s\n' "$bn" >>"$needs_fetch"
+      continue
+    fi
+    if git -C "$dir" merge-base --is-ancestor "$gl_sha" "$gh_sha" 2>/dev/null; then
+      printf '%s\n' "$bn" >>"$gh2gl"
+    elif git -C "$dir" merge-base --is-ancestor "$gh_sha" "$gl_sha" 2>/dev/null; then
+      printf '%s\n' "$bn" >>"$gl2gh"
+    else
+      printf '%s\n' "$bn" >>"$diverged"
+    fi
+  done < <(unique_ref_names "$gh_file" "$gl_file")
+}
+
+classify_tags() {
+  local gh_file="$1" gl_file="$2"
+  local gh2gl="$3" gl2gh="$4" clash="$5"
+  local tag gh_sha gl_sha
+
+  while IFS= read -r tag; do
+    [[ -z "$tag" ]] && continue
+    gh_sha=$(ref_sha_from_file "$gh_file" "$tag")
+    gl_sha=$(ref_sha_from_file "$gl_file" "$tag")
+    if [[ -z "$gh_sha" && -n "$gl_sha" ]]; then
+      printf '%s\n' "$tag" >>"$gl2gh"
+    elif [[ -n "$gh_sha" && -z "$gl_sha" ]]; then
+      printf '%s\n' "$tag" >>"$gh2gl"
+    elif [[ "$gh_sha" != "$gl_sha" ]]; then
+      printf '%s\n' "$tag" >>"$clash"
+    fi
+  done < <(unique_ref_names "$gh_file" "$gl_file")
+}
+
+log_bidirectional_plan() {
+  local repo="$1" work="$2"
+  log "PLAN ${repo} heads GH→GL: $(join_csv <"${work}/h_gh2gl")"
+  log "PLAN ${repo} heads GL→GH: $(join_csv <"${work}/h_gl2gh")"
+  log "PLAN ${repo} heads skip diverged: $(join_csv <"${work}/h_diverged")"
+  log "PLAN ${repo} heads classify after fetch: $(join_csv <"${work}/h_fetch")"
+  log "PLAN ${repo} tags GH→GL: $(join_csv <"${work}/t_gh2gl")"
+  log "PLAN ${repo} tags GL→GH: $(join_csv <"${work}/t_gl2gh")"
+  log "PLAN ${repo} tags skip clash: $(join_csv <"${work}/t_clash")"
+}
+
+sync_repo_bidirectional() {
+  local repo="$1"
+  local orig_on_gh="${REPO_ON_GITHUB[$repo]:-0}"
+  local orig_on_gl="${REPO_ON_GITLAB[$repo]:-0}"
+  local is_private="${REPO_PRIVATE[$repo]:-false}"
+  local gl_vis="${REPO_GL_VISIBILITY[$repo]:-private}"
+  local gh_url gl_url dir
+  local created_gh=0 created_gl=0
+  local gh_refs gl_refs gl_code
+  local work push_fail=0 name src_default=""
+  local json
+
+  gh_url=$(github_remote_url "$repo")
+  gl_url=$(gitlab_remote_url "$repo")
+  dir="${MIRROR_CACHE}/${repo}.git"
+
+  log "=== ${repo} (bidirectional) ==="
+
+  gl_code=$(gitlab_project_http_code "$repo")
+  if [[ "$gl_code" == "000" ]] || gitlab_http_retryable "$gl_code"; then
+    error "${repo}: could not reach GitLab API or project URL (HTTP ${gl_code})."
+    return 1
+  fi
+  [[ "$gl_code" == "200" ]] && orig_on_gl=1
+
+  gh_refs=""
+  if [[ "$orig_on_gh" == "1" ]]; then
+    gh_refs=$(ls_remote_refs_normalized "$gh_url" || true)
+  fi
+  gl_refs=""
+  if [[ "$gl_code" == "200" ]]; then
+    gl_refs=$(ls_remote_refs_normalized "$gl_url" || true)
+  fi
+
+  if [[ "$orig_on_gh" != "1" && "$gl_code" != "200" ]]; then
+    error "${repo}: present in neither GitHub listing nor GitLab API; skipping."
+    return 1
+  fi
+
+  if [[ "$orig_on_gh" != "1" ]]; then
+    is_private=$(gitlab_visibility_to_github_private "$gl_vis")
+    log "MISSING ${repo}: GitHub repository not found; creating (private=${is_private})"
+    github_create_repo "$repo" "$is_private" || return 1
+    created_gh=1
+    json=$(gitlab_get_project_json "$repo" 2>/dev/null || true)
+    src_default=$(printf '%s' "$json" | jq -r '.default_branch // empty')
+  fi
+
+  if [[ "$gl_code" != "200" ]]; then
+    log "MISSING ${repo}: GitLab project not found (HTTP ${gl_code})"
+    gitlab_create_project "$repo" "$is_private" || return 1
+    created_gl=1
+    gl_code=200
+    github_api_request GET "${GITHUB_API}/repos/${GITHUB_USER}/${repo}"
+    if [[ "${GITHUB_HTTP_CODE}" == "200" ]]; then
+      src_default=$(printf '%s' "${GITHUB_LAST_BODY}" | jq -r '.default_branch // empty')
+    fi
+  fi
+
+  if [[ "$orig_on_gh" == "1" && "$orig_on_gl" == "1" && "$created_gh" -eq 0 && "$created_gl" -eq 0 ]]; then
+    gitlab_sync_visibility "$repo" "$is_private"
+  fi
+
+  if [[ -z "$gh_refs" && -z "$gl_refs" ]]; then
+    log "OK ${repo}: both sides empty, no action"
+    maybe_sync_github_issues "$repo" "$gl_code"
+    return 0
+  fi
+
+  if [[ -n "$gh_refs" && "$gh_refs" == "$gl_refs" ]]; then
+    log "OK ${repo}: identical to GitLab (ls-remote), no action"
+    maybe_sync_github_issues "$repo" "$gl_code"
+    return 0
+  fi
+
+  work=$(mktemp -d "${TMPDIR:-/tmp}/mirror-bidi.XXXXXX")
+  : >"${work}/h_gh2gl" ; : >"${work}/h_gl2gh" ; : >"${work}/h_diverged" ; : >"${work}/h_fetch"
+  : >"${work}/t_gh2gl" ; : >"${work}/t_gl2gh" ; : >"${work}/t_clash"
+  parse_ls_remote_heads_tags "$gh_refs" "${work}/gh_heads" "${work}/gh_tags"
+  parse_ls_remote_heads_tags "$gl_refs" "${work}/gl_heads" "${work}/gl_tags"
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    classify_heads "$dir" "${work}/gh_heads" "${work}/gl_heads" 0 \
+      "${work}/h_gh2gl" "${work}/h_gl2gh" "${work}/h_diverged" "${work}/h_fetch"
+    classify_tags "${work}/gh_tags" "${work}/gl_tags" \
+      "${work}/t_gh2gl" "${work}/t_gl2gh" "${work}/t_clash"
+    log_bidirectional_plan "$repo" "$work"
+    dry "git fetch both remotes into namespaced refs; push listed refspecs (no prune)"
+    maybe_sync_github_issues "$repo" "$gl_code"
+    rm -rf "$work"
+    return 0
+  fi
+
+  log "DIFF ${repo}: ref lists differ; classifying via local bare cache"
+
+  ensure_bare_cache "$dir" || {
+    error "${repo}: failed to initialize bare cache."
+    rm -rf "$work"
+    return 1
+  }
+  ensure_git_remote "$dir" github "$gh_url"
+  ensure_git_remote "$dir" gitlab "$gl_url"
+  if ! fetch_bidirectional_refs "$dir"; then
+    error "${repo}: git fetch from GitHub and/or GitLab failed."
+    rm -rf "$work"
+    return 1
+  fi
+
+  write_cache_refs "$dir" "refs/remotes/github/" "${work}/gh_heads"
+  write_cache_refs "$dir" "refs/remotes/gitlab/" "${work}/gl_heads"
+  write_cache_refs "$dir" "refs/sync/github/tags/" "${work}/gh_tags"
+  write_cache_refs "$dir" "refs/sync/gitlab/tags/" "${work}/gl_tags"
+  : >"${work}/h_gh2gl" ; : >"${work}/h_gl2gh" ; : >"${work}/h_diverged" ; : >"${work}/h_fetch"
+  : >"${work}/t_gh2gl" ; : >"${work}/t_gl2gh" ; : >"${work}/t_clash"
+  classify_heads "$dir" "${work}/gh_heads" "${work}/gl_heads" 1 \
+    "${work}/h_gh2gl" "${work}/h_gl2gh" "${work}/h_diverged" "${work}/h_fetch"
+  classify_tags "${work}/gh_tags" "${work}/gl_tags" \
+    "${work}/t_gh2gl" "${work}/t_gl2gh" "${work}/t_clash"
+  log_bidirectional_plan "$repo" "$work"
+
+  while IFS= read -r name; do
+    [[ -z "$name" ]] && continue
+    warn "${repo}: diverged branch '${name}'; skipping (neither side is a fast-forward)"
+  done <"${work}/h_diverged"
+
+  while IFS= read -r name; do
+    [[ -z "$name" ]] && continue
+    warn "${repo}: tag clash '${name}' (different SHA); skipping"
+  done <"${work}/t_clash"
+
+  while IFS= read -r name; do
+    [[ -z "$name" ]] && continue
+    log "PUSH ${repo}: GH→GL branch ${name}"
+    if ! push_named_ref "$dir" gitlab "refs/remotes/github/${name}" "refs/heads/${name}"; then
+      warn "${repo}: push GH→GL branch '${name}' failed (protected branch or rejected)."
+      push_fail=$((push_fail + 1))
+    fi
+  done <"${work}/h_gh2gl"
+
+  while IFS= read -r name; do
+    [[ -z "$name" ]] && continue
+    log "PUSH ${repo}: GL→GH branch ${name}"
+    if ! push_named_ref "$dir" github "refs/remotes/gitlab/${name}" "refs/heads/${name}"; then
+      warn "${repo}: push GL→GH branch '${name}' failed (protected branch or rejected)."
+      push_fail=$((push_fail + 1))
+    fi
+  done <"${work}/h_gl2gh"
+
+  while IFS= read -r name; do
+    [[ -z "$name" ]] && continue
+    log "PUSH ${repo}: GH→GL tag ${name}"
+    if ! push_named_ref "$dir" gitlab "refs/sync/github/tags/${name}" "refs/tags/${name}"; then
+      warn "${repo}: push GH→GL tag '${name}' failed."
+      push_fail=$((push_fail + 1))
+    fi
+  done <"${work}/t_gh2gl"
+
+  while IFS= read -r name; do
+    [[ -z "$name" ]] && continue
+    log "PUSH ${repo}: GL→GH tag ${name}"
+    if ! push_named_ref "$dir" github "refs/sync/gitlab/tags/${name}" "refs/tags/${name}"; then
+      warn "${repo}: push GL→GH tag '${name}' failed."
+      push_fail=$((push_fail + 1))
+    fi
+  done <"${work}/t_gl2gh"
+
+  if [[ "$created_gh" -eq 1 ]]; then
+    github_set_default_branch "$repo" "$src_default"
+  elif [[ "$created_gl" -eq 1 ]]; then
+    gitlab_set_default_branch "$repo" "$src_default"
+  fi
+
+  rm -rf "$work"
+
+  maybe_sync_github_issues "$repo" 200
+  if [[ "$push_fail" -gt 0 ]]; then
+    error "${repo}: ${push_fail} ref push(es) failed."
+    return 1
+  fi
+  return 0
+}
+
 sync_repo() {
   local repo="$1"
+  if [[ "$BIDIRECTIONAL" -eq 1 ]]; then
+    sync_repo_bidirectional "$repo"
+    return $?
+  fi
   local is_private="${REPO_PRIVATE[$repo]:-false}"
   local gh_url gl_url dir
   gh_url=$(github_remote_url "$repo")
@@ -720,15 +1276,43 @@ while IFS=$'\t' read -r name priv; do
   [[ -z "${name:-}" ]] && continue
   REPO_NAMES+=("$name")
   REPO_PRIVATE["$name"]="$priv"
+  REPO_ON_GITHUB["$name"]=1
 done <"$idx"
 rm -f "$idx"
 
+if [[ "$BIDIRECTIONAL" -eq 1 ]]; then
+  glidx="${MIRROR_CACHE}/.gitlab-repo-index.tsv.tmp.$$"
+  if ! fetch_gitlab_project_index >"$glidx"; then
+    rm -f "$glidx"
+    error "Failed to list GitLab projects (check GITLAB_TOKEN, namespace, and network)."
+    exit 1
+  fi
+  while IFS=$'\t' read -r name vis; do
+    [[ -z "${name:-}" ]] && continue
+    REPO_ON_GITLAB["$name"]=1
+    REPO_GL_VISIBILITY["$name"]="$vis"
+    if [[ -z "${REPO_ON_GITHUB[$name]:-}" ]]; then
+      REPO_NAMES+=("$name")
+      REPO_PRIVATE["$name"]=$(gitlab_visibility_to_github_private "$vis")
+    fi
+  done <"$glidx"
+  rm -f "$glidx"
+fi
+
 if [[ ${#REPO_NAMES[@]} -eq 0 ]]; then
-  log "No repositories returned (GitHub list mode: ${GITHUB_REPO_LIST_MODE})."
+  if [[ "$BIDIRECTIONAL" -eq 1 ]]; then
+    log "No repositories returned (GitHub list mode: ${GITHUB_REPO_LIST_MODE}; GitLab owned projects)."
+  else
+    log "No repositories returned (GitHub list mode: ${GITHUB_REPO_LIST_MODE})."
+  fi
   exit 0
 fi
 
-log "Processing ${#REPO_NAMES[@]} GitHub repo(s) (list mode: ${GITHUB_REPO_LIST_MODE})."
+if [[ "$BIDIRECTIONAL" -eq 1 ]]; then
+  log "Processing ${#REPO_NAMES[@]} repo(s) (bidirectional; GitHub list mode: ${GITHUB_REPO_LIST_MODE} union GitLab)."
+else
+  log "Processing ${#REPO_NAMES[@]} GitHub repo(s) (list mode: ${GITHUB_REPO_LIST_MODE})."
+fi
 failures=0
 for r in "${REPO_NAMES[@]}"; do
   if ! sync_repo "$r"; then
